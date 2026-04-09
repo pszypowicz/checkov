@@ -597,4 +597,140 @@ def test_foreach_renderer_with_raw_asset():
             assert virtual_resource.endswith("[\"bucket_a\"]") or virtual_resource.endswith("[\"bucket_b\"]")
 
 
+def test_foreach_with_function_in_local():
+    """Test for_each/count expansion when the local value is a function call with literal arguments.
+
+    Reproduces https://github.com/bridgecrewio/checkov/issues/7215:
+    the HCL parser wraps function calls in ${...}, and substituting that into
+    another ${...} expression produced nested interpolation that could not be evaluated.
+    """
+    dir_name = 'foreach_examples/foreach_function_in_local'
+    graph, _ = build_and_get_graph_by_path(dir_name, render_var=True)
+
+    resource_names = sorted(v.name for v in graph.vertices if v.block_type == 'resource')
+
+    membership_resources = [n for n in resource_names if n.startswith('aws_iam_group_membership.')]
+    assert len(membership_resources) == 16  # 3+3+3+3+2+1+1
+
+    # concat case: for_each = toset(local.concat_list) where concat_list = concat(["mail1","mail2"],["mail3"])
+    concat_resources = [n for n in resource_names if '.concat_case[' in n]
+    assert len(concat_resources) == 3
+    assert 'aws_iam_group_membership.concat_case["mail1"]' in resource_names
+    assert 'aws_iam_group_membership.concat_case["mail2"]' in resource_names
+    assert 'aws_iam_group_membership.concat_case["mail3"]' in resource_names
+
+    # flatten case: for_each = toset(local.flatten_list) where flatten_list = flatten([["mail4","mail5"],["mail6"]])
+    flatten_resources = [n for n in resource_names if 'flatten_case' in n]
+    assert len(flatten_resources) == 3
+    assert 'aws_iam_group_membership.flatten_case["mail4"]' in resource_names
+    assert 'aws_iam_group_membership.flatten_case["mail5"]' in resource_names
+    assert 'aws_iam_group_membership.flatten_case["mail6"]' in resource_names
+
+    # toset_concat case: for_each = local.toset_concat where toset_concat = toset(concat(...)) -- regression check
+    toset_resources = [n for n in resource_names if 'toset_concat_case' in n]
+    assert len(toset_resources) == 3
+    assert 'aws_iam_group_membership.toset_concat_case["mail7"]' in resource_names
+    assert 'aws_iam_group_membership.toset_concat_case["mail8"]' in resource_names
+    assert 'aws_iam_group_membership.toset_concat_case["mail9"]' in resource_names
+
+    # count case: count = local.count_val where count_val = length(concat(["a","b"],["c"]))
+    count_resources = [n for n in resource_names if 'count_case' in n]
+    assert len(count_resources) == 3
+    assert 'aws_iam_group_membership.count_case[0]' in resource_names
+    assert 'aws_iam_group_membership.count_case[1]' in resource_names
+    assert 'aws_iam_group_membership.count_case[2]' in resource_names
+
+    # map case: for_each = local.zipped where zipped = zipmap(["a","b"],["val_a","val_b"])
+    map_resources = [n for n in resource_names if 'map_case' in n]
+    assert len(map_resources) == 2
+    assert 'aws_iam_group_membership.map_case["a"]' in resource_names
+    assert 'aws_iam_group_membership.map_case["b"]' in resource_names
+
+    # upper case: for_each = toset([local.upper_name]) where upper_name = upper("hello")
+    # Tests string-returning function pre-evaluation (the guard must allow string results)
+    upper_resources = [n for n in resource_names if 'upper_case' in n]
+    assert len(upper_resources) == 1
+    assert 'aws_iam_group_membership.upper_case["HELLO"]' in resource_names
+
+    # join case: for_each = toset([local.joined]) where joined = join("-", ["a", "b"])
+    join_resources = [n for n in resource_names if 'join_case' in n]
+    assert len(join_resources) == 1
+    assert 'aws_iam_group_membership.join_case["a-b"]' in resource_names
+
+
+def test_pre_evaluate_sub_graph_vertices():
+    """Focused unit test for _pre_evaluate_sub_graph_vertices.
+
+    Constructs a minimal sub-graph with known attributes and verifies the method
+    correctly applies or skips evaluation for each case.
+    """
+    from unittest.mock import MagicMock
+    from checkov.terraform.graph_builder.graph_components.blocks import TerraformBlock
+    from checkov.terraform.graph_builder.graph_components.block_types import BlockType
+
+    def make_locals_block(name, attributes):
+        return TerraformBlock(
+            name=name, config={}, path="test.tf",
+            block_type=BlockType.LOCALS, attributes=attributes,
+        )
+
+    def make_resource_block(name, attributes):
+        return TerraformBlock(
+            name=name, config={}, path="test.tf",
+            block_type=BlockType.RESOURCE, attributes=attributes,
+        )
+
+    # idx=0: LOCALS -- non-string result (concat -> list)
+    v0 = make_locals_block("locals_concat", {"concat_list": ['${concat(["a", "b"], ["c"])}']})
+    # idx=1: LOCALS -- string result from successful evaluation (upper -> "HELLO")
+    v1 = make_locals_block("locals_upper", {"upper_name": ['${upper("hello")}']})
+    # idx=2: LOCALS -- unresolved variable reference (should NOT be updated)
+    v2 = make_locals_block("locals_var_ref", {"ref_val": ['${concat(var.list1, ["extra"])}']})
+    # idx=3: LOCALS -- unsupported function (should NOT be updated)
+    v3 = make_locals_block("locals_unsupported", {"unsupported": ['${cidrsubnet("10.0.0.0/16", 8, 1)}']})
+    # idx=4: LOCALS -- plain string attribute, not a list (should be skipped)
+    v4 = make_locals_block("locals_plain", {"plain": "some_string"})
+    # idx=5: LOCALS in blocks_to_render (should be skipped entirely)
+    v5 = make_locals_block("locals_render", {"val": ['${upper("hello")}']})
+    # idx=6: RESOURCE block (should be skipped by block_type guard)
+    v6 = make_resource_block("aws_s3_bucket.test", {"val": ['${upper("hello")}']})
+    # idx=7: empty dict placeholder (should be skipped by `not vertex` guard)
+    v7 = {}
+    # idx=8: LOCALS -- references another local (should NOT be updated due to REFERENCES_VALUES)
+    v8 = make_locals_block("locals_derived", {"derived": ['${flatten([local.concat_list, ["extra"]])}']})
+
+    sub_graph = MagicMock()
+    sub_graph.vertices = [v0, v1, v2, v3, v4, v5, v6, v7, v8]
+
+    ForeachAbstractHandler._pre_evaluate_sub_graph_vertices(sub_graph, blocks_to_render=[5])
+
+    # Case 1: concat -> list (non-string result applied)
+    assert v0.attributes["concat_list"] == ["a", "b", "c"]
+
+    # Case 2: upper -> "HELLO" (string result applied via triple guard)
+    assert v1.attributes["upper_name"] == "HELLO"
+
+    # Case 3: unresolved variable reference (unchanged -- REFERENCES_VALUES blocks it)
+    assert v2.attributes["ref_val"] == ['${concat(var.list1, ["extra"])}']
+
+    # Case 4: unsupported function (unchanged -- evaluated == strip_interpolation_marks)
+    assert v3.attributes["unsupported"] == ['${cidrsubnet("10.0.0.0/16", 8, 1)}']
+
+    # Case 5: plain string, not a list (unchanged -- fails isinstance check)
+    assert v4.attributes["plain"] == "some_string"
+
+    # Case 6: in blocks_to_render (unchanged -- skipped by blocks_to_render guard)
+    assert v5.attributes["val"] == ['${upper("hello")}']
+
+    # Case 7: RESOURCE block (unchanged -- skipped by block_type guard)
+    assert v6.attributes["val"] == ['${upper("hello")}']
+
+    # Case 8: local reference (unchanged -- REFERENCES_VALUES blocks it)
+    assert v8.attributes["derived"] == ['${flatten([local.concat_list, ["extra"]])}']
+
+    # Verify idempotency - second call should not alter already-evaluated results
+    ForeachAbstractHandler._pre_evaluate_sub_graph_vertices(sub_graph, blocks_to_render=[5])
+    assert v0.attributes["concat_list"] == ["a", "b", "c"]
+    assert v1.attributes["upper_name"] == "HELLO"
+    assert v2.attributes["ref_val"] == ['${concat(var.list1, ["extra"])}']
 
