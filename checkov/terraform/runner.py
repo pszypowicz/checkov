@@ -44,6 +44,20 @@ _TerraformDefinitions: TypeAlias = "dict[TFDefinitionKey, dict[str, Any]]"
 CHECK_BLOCK_TYPES = frozenset(["resource", "data", "provider", "module"])
 
 
+def _strip_foreach_suffix(segment: str) -> str:
+    """Strip a trailing ``[N]`` or ``["key"]`` suffix from a block-name segment.
+
+    ``ForeachBuilder`` renames vertices to e.g. ``vault[0]`` or ``vault["dev"]``
+    after for_each/count expansion, but the context dict is keyed under the
+    unindexed source name (``vault``). Stripping the suffix lets
+    :meth:`Runner.get_entity_context_and_evaluations` walk the context dict
+    successfully for expanded vertices.
+    """
+    if "[" in segment and segment.endswith("]"):
+        return segment[: segment.index("[")]
+    return segment
+
+
 class Runner(BaseTerraformRunner[_TerraformDefinitions, _TerraformContext, TFDefinitionKey]):
     check_type = CheckType.TERRAFORM  # noqa: CCE003  # a static attribute
 
@@ -482,16 +496,16 @@ class Runner(BaseTerraformRunner[_TerraformDefinitions, _TerraformContext, TFDef
         )
 
         definition_path = entity[CustomAttributes.BLOCK_NAME].split(".")
-        entity_context_path = [block_type] + definition_path
+        lookup_path = [block_type] + [_strip_foreach_suffix(p) for p in definition_path]
         try:
             entity_context = self.context[full_file_path]  # type:ignore[index]  # at this point self.context is set
-            for k in entity_context_path:
+            for k in lookup_path:
                 if k in entity_context:
                     entity_context = entity_context[k]
                 else:
-                    logging.warning(f'Failed to find context for {".".join(entity_context_path)}')
+                    logging.warning(f'Failed to find context for {".".join(lookup_path)}')
                     return None
-            entity_context["definition_path"] = definition_path
+            entity_context["definition_path"] = definition_path  # keep original for display
         except KeyError:
             logging.error(f"Did not find context for key {full_file_path}")
             return {}
