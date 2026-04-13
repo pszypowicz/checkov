@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import json
+import logging
 import re
 import typing
 from typing import Any
@@ -14,7 +15,7 @@ from checkov.terraform.graph_builder.foreach.consts import COUNT_STRING, FOREACH
 from checkov.terraform.graph_builder.foreach.utils import append_virtual_resource
 from checkov.terraform.graph_builder.graph_components.block_types import BlockType
 from checkov.terraform.graph_builder.graph_components.blocks import TerraformBlock
-from checkov.terraform.graph_builder.variable_rendering.evaluate_terraform import evaluate_terraform
+from checkov.terraform.graph_builder.variable_rendering.evaluate_terraform import evaluate_terraform, strip_interpolation_marks
 from checkov.terraform.graph_builder.variable_rendering.renderer import TerraformVariableRenderer
 
 if typing.TYPE_CHECKING:
@@ -57,9 +58,40 @@ class ForeachAbstractHandler:
 
     @staticmethod
     def _render_sub_graph(sub_graph: TerraformLocalGraph, blocks_to_render: list[int]) -> None:
+        ForeachAbstractHandler._pre_evaluate_sub_graph_vertices(sub_graph, blocks_to_render)
         renderer = TerraformVariableRenderer(sub_graph)
         renderer.vertices_index_to_render = blocks_to_render
         renderer.render_variables_from_local_graph()
+
+    @staticmethod
+    def _pre_evaluate_sub_graph_vertices(sub_graph: TerraformLocalGraph, blocks_to_render: list[int]) -> None:
+        """Pre-evaluate self-contained locals to prevent nested ${...} from HCL-parser-wrapped function calls.
+
+        Evaluates locals with no var/module/local references so downstream substitution
+        produces single-level expressions. String results are applied only when evaluation
+        actually resolved the function (not just stripped interpolation marks).
+        """
+        blocks_to_render_set = set(blocks_to_render)
+        for idx, vertex in enumerate(sub_graph.vertices):
+            # {} placeholders from _build_sub_graph are falsy, skipping empty vertices
+            if not vertex or idx in blocks_to_render_set or vertex.block_type != BlockType.LOCALS:
+                continue
+            for attr_key, attr_value in list(vertex.attributes.items()):
+                if isinstance(attr_value, list) and len(attr_value) == 1 and isinstance(attr_value[0], str):
+                    try:
+                        evaluated = evaluate_terraform(attr_value[0])
+                        # Non-string results (lists, dicts, ints, bools) are always applied
+                        if evaluated is not None and not isinstance(evaluated, str):
+                            vertex.attributes[attr_key] = evaluated
+                        elif (evaluated != attr_value[0]
+                              and evaluated != strip_interpolation_marks(attr_value[0])
+                              and not re.search(REFERENCES_VALUES, attr_value[0])):
+                            # String result differs from both original and bare expression,
+                            # and contains no unresolved references - function was resolved
+                            vertex.attributes[attr_key] = evaluated
+                    except Exception:
+                        logging.debug(f"Pre-evaluation failed for {attr_key} in {vertex.name}, skipping")
+                        continue
 
     def _build_sub_graph(self, blocks_to_render: list[int]) -> TerraformLocalGraph:
         from checkov.terraform.graph_builder.local_graph import TerraformLocalGraph
